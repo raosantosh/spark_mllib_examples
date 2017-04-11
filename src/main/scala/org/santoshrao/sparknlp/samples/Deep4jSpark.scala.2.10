@@ -1,0 +1,88 @@
+package com.yahoo.sparknlp.samples
+
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkContext._
+import org.apache.spark.SparkConf
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.{Row, SQLContext}
+import org.apache.spark.api.java.JavaRDD;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.spark.SparkConf;
+import org.deeplearning4j.eval.Evaluation;
+import org.deeplearning4j.nn.api.OptimizationAlgorithm;
+import org.deeplearning4j.nn.conf.MultiLayerConfiguration;
+import org.deeplearning4j.nn.conf.NeuralNetConfiguration;
+import org.deeplearning4j.nn.conf.layers.DenseLayer;
+import org.deeplearning4j.nn.conf.layers.FeedForwardLayer;
+import org.deeplearning4j.nn.conf.layers.OutputLayer;
+import org.deeplearning4j.nn.multilayer.MultiLayerNetwork;
+import org.deeplearning4j.nn.weights.WeightInit;
+import org.deeplearning4j.spark.canova.RecordReaderFunction;
+import org.deeplearning4j.spark.impl.multilayer.SparkDl4jMultiLayer;
+import org.deeplearning4j.spark.impl.paramavg.ParameterAveragingTrainingMaster;
+import org.nd4j.linalg.dataset.DataSet;
+import org.nd4j.linalg.io.ClassPathResource;
+import org.nd4j.linalg.lossfunctions.LossFunctions;
+
+import org.canova.api.records.reader.RecordReader;
+import org.canova.api.records.reader.impl.CSVRecordReader;
+
+object Deep4jSpark {
+
+  //case class Row(name: String, age: String)
+
+  def main(args: Array[String]) {
+
+    val spark = SparkSession.builder().appName("Spark SQL Example").config("spark.some.config.option", "some-value").getOrCreate()
+
+    import spark.implicits._
+
+    val logFile = "/Users/santrao/work/spike/spark/sample/data/iris_dl.txt" // Should be some file on your system
+    val conf = new SparkConf().setAppName("Simple Application")
+    val sc = new SparkContext(conf)
+
+    val numInputs = 4;
+    val outputNum = 3;
+    val iterations = 1;
+    val labelIndex = 4;
+    val numOutputClasses = 3;
+
+    val irisDataLines: JavaRDD[String] = sc.textFile("")
+    val recordReader = new CSVRecordReader(0,",")
+    val trainingData: JavaRDD[DataSet] = irisDataLines.map(new RecordReaderFunction(recordReader, labelIndex, numOutputClasses));
+
+    val schemaString = "name age"
+    val fields = schemaString.split(" ").map(fieldName => StructField(fieldName, StringType, nullable = true))
+    val schema = StructType(fields)
+
+    val multiLayerConf = new NeuralNetConfiguration.Builder().seed(12345).iterations(iterations).optimizationAlgo(OptimizationAlgorithm.STOCHASTIC_GRADIENT_DESCENT)
+                .learningRate(0.5).regularization(true).l2(1e-4).activation("tanh").weightInit(WeightInit.XAVIER).list().layer(0, new DenseLayer.Builder().nIn(numInputs).nOut(3).build())
+                .layer(1, new DenseLayer.Builder().nIn(3).nOut(2).build()).layer(2, new OutputLayer.Builder(LossFunctions.LossFunction.MCXENT).activation("softmax").nIn(2).nOut(outputNum).build())
+                .backprop(true).pretrain(false)
+                .build()
+
+    val multiLayerNet = new MultiLayerNetwork(multiLayerConf)
+    multiLayerNet.init()
+
+    val examplesPerDataSetObject = 1
+    val parameterTM = new ParameterAveragingTrainingMaster.Builder(examplesPerDataSetObject)
+                .workerPrefetchNumBatches(2)    //Asynchronously prefetch up to 2 batches
+                .saveUpdater(true)
+                .averagingFrequency(1)  //See comments on averaging frequency in LSTM example. Averaging every 1 iteration is inefficient in practical problems
+                .batchSizePerWorker(8)  //Number of examples that each worker gets, per fit operation
+                .build()
+
+   val sparkNetwork = new SparkDl4jMultiLayer(sc,multiLayerNet,parameterTM)
+
+   val nEpochs = 100
+   sparkNetwork.fit(trainingData)
+
+  //Finally: evaluate the (training) data accuracy in a distributed manner:
+   val evaluation = sparkNetwork.evaluate(trainingData)
+   println(evaluation.stats())
+  }
+}
